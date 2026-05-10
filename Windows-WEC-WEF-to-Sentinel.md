@@ -239,7 +239,7 @@ winrm quickconfig /q
 ### 3.2 Set the Subscription Manager
 
 ```powershell
-Set-Item WSMan:\localhost\Client\TrustedHosts -Value "wec-1.kcl.com" -Force
+winrm set winrm/config/client @{TrustedHosts="WEC-SERVER-FQDN"}
 
 reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager" /v 1 /t REG_SZ /d "Server=http://WEC-SERVER-FQDN:5985/wsman/SubscriptionManager/WEC,Refresh=60" /f
 ```
@@ -622,7 +622,6 @@ Examples:
 
 ---
 
-
 ## Part 9 — Generating Test Security Events and Verifying in Sentinel
 
 ### 9.1 Generate Security Events on the Source Server
@@ -742,3 +741,250 @@ WindowsEvent
 If you see `win-log-1.kcl.com` as the Computer with your test Event IDs, the full chain is working: source server → WEF → WEC collector → AMA → Sentinel.
 
 ---
+
+## Part 10 — Configuring HTTPS for WEF (TCP 5986)
+
+HTTPS WEF encrypts the WinRM transport between source servers and the WEC collector using TLS certificates. This requires certificates on **both sides** — a server certificate on the WEC collector for the HTTPS listener, and a client certificate on each source server for client authentication.
+
+### 10.1 Certificate Requirements
+
+**WEC Collector certificate must:**
+- Have the collector's FQDN (e.g., `wec-1.kcl.com`) in the Subject or Subject Alternative Name (SAN)
+- Be in the Local Machine → Personal certificate store (`Cert:\LocalMachine\My`)
+- Have a private key
+- Include Server Authentication (1.3.6.1.5.5.7.3.1) in Enhanced Key Usage
+- Be trusted by all source servers
+
+**Source Server certificates must:**
+- Have the source server's FQDN in the Subject or SAN
+- Be in the Local Machine → Personal certificate store
+- Have a private key
+- Include Client Authentication (1.3.6.1.5.5.7.3.2) in Enhanced Key Usage
+- Be trusted by the WEC collector
+
+### 10.2 Certificate Options
+
+| Option | How to Obtain | Trust Distribution | Best For |
+|--------|--------------|-------------------|----------|
+| **AD Certificate Services (AD CS)** | Enterprise CA auto-enrolls via GPO using the Machine template | Automatic — all domain-joined machines trust the Enterprise CA | Domain environments at scale |
+| **Microsoft Cloud PKI (Intune)** | Cloud-native CA issues certs via SCEP/PKCS Intune profiles | Intune-managed devices trust the cloud CA | Hybrid Entra joined / Intune-managed environments |
+| **Azure Key Vault** | Generate or import certificates, integrate with partner CAs (DigiCert, GlobalSign) | Manual distribution or automation via DevOps pipelines | Application certificates, non-domain environments |
+| **Third-Party CA** | Purchase from DigiCert, GlobalSign, Sectigo, etc. | Import CA cert to Trusted Root on all servers | Non-domain environments, external-facing WEC collectors |
+| **Self-Signed** | `New-SelfSignedCertificate` PowerShell cmdlet | Manual — export and import to Trusted Root on each server | Lab and testing only |
+
+> **Recommendation:** For domain-joined environments, AD CS with the Machine template and GPO auto-enrollment is the simplest path. Every domain-joined server gets a certificate automatically and trust is handled by the domain.
+
+### 10.3 Obtaining Certificates
+
+#### Option A: AD CS (Enterprise CA with Auto-Enrollment)
+
+If an Enterprise CA is available, request a machine certificate. On each server (WEC collector and source servers):
+
+```powershell
+Get-Certificate -Template "Machine" -CertStoreLocation "Cert:\LocalMachine\My"
+```
+
+For auto-enrollment at scale via GPO:
+1. On the CA, ensure the **Computer** template grants **Domain Computers** the **Autoenroll** permission
+2. Issue the template: CA console → Certificate Templates → New → Certificate Template to Issue → select **Computer**
+3. Create a GPO: **Computer Configuration → Windows Settings → Security Settings → Public Key Policies → Certificate Services Client - Auto-Enrollment** → Enable
+
+After `gpupdate /force`, every domain-joined server receives a certificate automatically.
+
+#### Option B: Self-Signed (Lab/Testing Only)
+
+On the **WEC collector**:
+
+```powershell
+$cert = New-SelfSignedCertificate `
+    -DnsName "wec-1.kcl.com" `
+    -CertStoreLocation "Cert:\LocalMachine\My" `
+    -KeyLength 2048 `
+    -NotAfter (Get-Date).AddYears(3)
+
+Export-Certificate -Cert $cert -FilePath "C:\WEC-Cert.cer"
+$cert.Thumbprint
+```
+
+On each **source server**, import the WEC collector's cert into Trusted Root:
+
+```powershell
+Import-Certificate -FilePath "C:\WEC-Cert.cer" -CertStoreLocation "Cert:\LocalMachine\Root"
+```
+
+Repeat for source server certs — generate a self-signed cert on each source, export, and import into Trusted Root on the WEC collector. Or distribute via GPO: **Computer Configuration → Windows Settings → Security Settings → Public Key Policies → Trusted Root Certification Authorities** → Import.
+
+### 10.4 Configure the HTTPS Listener on the WEC Collector
+
+All commands in this section run on the **WEC collector** (`wec-1.kcl.com`).
+
+**Step 1: Identify the certificate thumbprint:**
+
+```powershell
+Get-ChildItem Cert:\LocalMachine\My | Format-List Subject, Thumbprint, DnsNameList, EnhancedKeyUsageList
+```
+
+Find the certificate with your WEC collector's FQDN in the Subject (e.g., `CN=wec-1.kcl.com`). Copy the thumbprint.
+
+**Step 2: Create the HTTPS listener:**
+
+```powershell
+New-WSManInstance winrm/config/Listener `
+    -SelectorSet @{Address="*"; Transport="HTTPS"} `
+    -ValueSet @{Hostname="wec-1.kcl.com"; CertificateThumbprint="YOUR_THUMBPRINT_HERE"}
+```
+
+> **Important:** The `Hostname` value must exactly match the certificate's Subject CN or SAN entry. Case matters.
+
+**Step 3: Verify the listener:**
+
+```powershell
+winrm enumerate winrm/config/Listener
+```
+
+You should see two listeners:
+- HTTP on port 5985
+- HTTPS on port 5986
+
+**Step 4: Open the firewall for port 5986:**
+
+```powershell
+New-NetFirewallRule -DisplayName "WinRM HTTPS" -Direction Inbound -Protocol TCP -LocalPort 5986 -Action Allow
+```
+
+### 10.5 Issue a Machine Certificate on Each Source Server
+
+Each source server needs its own machine certificate for client authentication over HTTPS.
+
+On each **source server** (e.g., `win-log-1.kcl.com`):
+
+```powershell
+Get-Certificate -Template "Machine" -CertStoreLocation "Cert:\LocalMachine\My"
+```
+
+Verify the certificate was issued:
+
+```powershell
+Get-ChildItem Cert:\LocalMachine\My | Format-List Subject, Thumbprint
+```
+
+Confirm you see a certificate with the source server's FQDN (e.g., `CN=win-log-1.kcl.com`).
+
+> **Note:** With AD CS auto-enrollment via GPO, this step happens automatically on every domain-joined machine. No manual per-server action needed.
+
+### 10.6 Switch the Subscription to HTTPS
+
+On the **WEC collector** (`wec-1.kcl.com`):
+
+```powershell
+wecutil ss "Security-Events" /tn:HTTPS
+Restart-Service Wecsvc
+```
+
+### 10.7 Update Source Servers to Use HTTPS
+
+**Manual (single server):**
+
+On the **source server** (`win-log-1.kcl.com`):
+
+```powershell
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager" /v 1 /t REG_SZ /d "Server=https://wec-1.kcl.com:5986/wsman/SubscriptionManager/WEC,Refresh=60" /f
+Restart-Service WinRM
+```
+
+**Via GPO (at scale):**
+
+Update the GPO at **Computer Configuration → Administrative Templates → Windows Components → Event Forwarding → Configure Target Subscription Manager**:
+
+```
+Server=https://wec-1.kcl.com:5986/wsman/SubscriptionManager/WEC,Refresh=60
+```
+
+Note the changes from HTTP: `https://` instead of `http://` and port `5986` instead of `5985`.
+
+### 10.8 Verify HTTPS WEF Is Working
+
+**Step 1: Test HTTPS connectivity from the source server:**
+
+```powershell
+Test-NetConnection wec-1.kcl.com -Port 5986
+Test-WSMan -ComputerName wec-1.kcl.com -UseSSL
+```
+
+**Step 2: Check subscription status on the WEC collector:**
+
+```powershell
+wecutil gr "Security-Events"
+```
+
+Source servers should show **RunTimeStatus: Active** with **LastError: 0**.
+
+**Step 3: Generate a test event on the source server:**
+
+```powershell
+net use \\localhost /user:fakeuser fakepassword 2>$null
+```
+
+**Step 4: Verify events arrived on the WEC collector:**
+
+```powershell
+wevtutil qe ForwardedEvents /c:5 /f:text /rd:true
+```
+
+**Step 5: Verify in Sentinel:**
+
+```kql
+WindowsEvent
+| where TimeGenerated > ago(30m)
+| where Computer == "win-log-1.kcl.com"
+| summarize count() by EventID
+| sort by count_ desc
+```
+
+### 10.9 Optional: Disable HTTP Listener
+
+Once HTTPS is confirmed working end to end, you can remove the HTTP listener to force all WEF traffic over HTTPS. Run on the **WEC collector**:
+
+```powershell
+# Remove the HTTP listener
+winrm delete winrm/config/Listener?Address=*+Transport=HTTP
+
+# Close port 5985
+Remove-NetFirewallRule -DisplayName "Windows Remote Management (HTTP-In)"
+```
+
+> **Warning:** Only disable HTTP after confirming HTTPS is fully operational and all source servers have been updated to use HTTPS. Removing the HTTP listener while source servers are still configured for HTTP will break forwarding immediately.
+
+### 10.10 HTTPS Troubleshooting
+
+| Issue | Likely Cause | Fix |
+|-------|-------------|-----|
+| `wecutil gr` shows error 0x6ba (RPC unavailable) | Wecsvc service crashed after transport change | `Restart-Service Wecsvc` |
+| `wecutil gr` shows error 0x2 (file not found) | Subscription corrupted during transport switch | Delete and recreate the subscription |
+| Certificate CN and hostname do not match | Hostname in `New-WSManInstance` doesn't match cert Subject | Check cert with `Get-ChildItem Cert:\LocalMachine\My | FL Subject, DnsNameList` and use exact match |
+| Certificate thumbprint is blank or invalid | Wrong cert selected, or extra character in thumbprint | Verify thumbprint with `Get-ChildItem Cert:\LocalMachine\My | FL Thumbprint` |
+| Source shows Inactive after switching to HTTPS | Source server missing machine certificate for client auth | Run `Get-Certificate -Template "Machine"` on the source server |
+| Source can't connect on 5986 | Firewall blocking | `Test-NetConnection wec-1.kcl.com -Port 5986` from source; add firewall rule if needed |
+| `Test-WSMan -UseSSL` fails with trust error | Source server doesn't trust the CA that issued the WEC cert | Import CA cert into `Cert:\LocalMachine\Root` on the source |
+
+### 10.11 HTTPS Quick Checklist
+
+| Step | Where | Command |
+|------|-------|---------|
+| Certificate on WEC collector | WEC | `Get-ChildItem Cert:\LocalMachine\My | FL Subject, Thumbprint` |
+| HTTPS listener created | WEC | `winrm enumerate winrm/config/Listener` |
+| Port 5986 open | WEC | `Get-NetFirewallRule -DisplayName "WinRM HTTPS"` |
+| Subscription set to HTTPS | WEC | `wecutil gs "Security-Events"` (check TransportName) |
+| Certificate on source server | Source | `Get-ChildItem Cert:\LocalMachine\My | FL Subject, Thumbprint` |
+| Registry updated to HTTPS/5986 | Source | `Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\...\SubscriptionManager"` |
+| Source showing Active | WEC | `wecutil gr "Security-Events"` |
+| Events arriving | WEC | `wevtutil qe ForwardedEvents /c:5 /f:text /rd:true` |
+| Events in Sentinel | Sentinel | `WindowsEvent | where TimeGenerated > ago(30m)` |
+
+---
+
+## Part 11 — Pending Items
+
+- XPath filter optimization examples for common security detection use cases
+- Multiple WEC collector load balancing via AD security group GPO distribution
+- Certificate renewal and rotation procedures for HTTPS WEF
