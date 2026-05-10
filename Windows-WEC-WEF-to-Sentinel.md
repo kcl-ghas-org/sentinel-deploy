@@ -242,6 +242,8 @@ winrm quickconfig /q
 winrm set winrm/config/client @{TrustedHosts="WEC-SERVER-FQDN"}
 
 reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager" /v 1 /t REG_SZ /d "Server=http://WEC-SERVER-FQDN:5985/wsman/SubscriptionManager/WEC,Refresh=60" /f
+
+**-if the above step gives error, use PowerShell command: Set-Item WSMan:\localhost\Client\TrustedHosts -Value "wec-1.kcl.com" -Force
 ```
 
 ### 3.3 Restart Services
