@@ -271,6 +271,8 @@ Test connectivity to the collector:
 
 ```powershell
 Test-NetConnection WEC-SERVER-FQDN -Port 5985
+
+If using HTTPS: Test-NetConnection WEC-SERVER-FQDN -Port 5986
 ```
 
 > **Note:** `wecutil er` only works on the WEC collector, not on source servers. To confirm the source server is forwarding, check the subscription status on the collector with `wecutil gs "Subscription-Name"` and look for the source server listed with **Active** status.
