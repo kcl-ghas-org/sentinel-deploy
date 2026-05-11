@@ -246,14 +246,25 @@ reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\Subsc
 **-if the above step gives error, use PowerShell command: Set-Item WSMan:\localhost\Client\TrustedHosts -Value "wec-1.kcl.com" -Force
 ```
 
-### 3.3 Restart Services
+### 3.3 Install Machine Certificate. 
+
+```powershell
+Get-Certificate -Template "Machine" -CertStoreLocation "Cert:\LocalMachine\My"
+
+Then add NETWORK SERVICE to Event Log Readers:
+
+net localgroup "Event Log Readers" "NETWORK SERVICE" /add
+Restart-Service WinRM
+```
+
+### 3.4 Restart Services
 
 ```powershell
 Restart-Service WinRM
 Restart-Service EventLog
 ```
 
-### 3.4 Verify
+### 3.5 Verify
 
 Verify the subscription manager registry key was set:
 
