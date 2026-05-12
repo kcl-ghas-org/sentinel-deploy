@@ -385,7 +385,7 @@ az monitor log-analytics workspace get-shared-keys --resource-group "your-rg" --
 
 ---
 
-## Part 5 — Sentinel KQL Queries
+## Part 5 — Sentinel KQL Queries - Additional KQL
 
 ### Health Check — Are Forwarded Events Arriving?
 
